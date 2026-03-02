@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="theme-color" content="#1a1a2e">
+<title>Tiedan AI</title>
+<link rel="manifest" href="/manifest.json">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#1a1a2e;color:#fff;font-family:system-ui;height:100vh;height:100dvh;display:flex;flex-direction:column;align-items:center;overflow:hidden;-webkit-user-select:none;user-select:none}
+#face{flex:1;width:100%;position:relative;display:flex;align-items:center;justify-content:center}
+#pixel-canvas canvas{image-rendering:pixelated;width:min(70vw,280px);height:min(70vw,280px)}
+#vol-ring{position:absolute;bottom:12px;left:50%;transform:translateX(-50%);width:80%;height:6px;background:rgba(255,255,255,0.05);border-radius:3px;overflow:hidden}
+#vol-fill{height:100%;width:0%;background:linear-gradient(90deg,#4fc3f7,#66bb6a);border-radius:3px;transition:width 0.08s}
+#bottom{width:100%;padding:8px 16px calc(env(safe-area-inset-bottom,16px) + 20px);display:flex;flex-direction:column;align-items:center;gap:8px;background:linear-gradient(transparent,rgba(26,26,46,0.95))}
+#asr-text{font-size:13px;color:#888;min-height:18px;text-align:center;max-width:90%}
+#sub{font-size:15px;color:#ddd;min-height:22px;text-align:center;max-width:90%;line-height:1.5;max-height:80px;overflow-y:auto}
+#controls{display:flex;align-items:center;gap:12px}
+#mode{font-size:11px;padding:3px 12px;border-radius:12px;display:inline-block;letter-spacing:0.5px}
+#mode.idle{background:rgba(255,255,255,0.08);color:#888}
+#mode.connecting{background:rgba(255,215,64,0.2);color:#ffd740;animation:pulse 1s infinite}
+#mode.listening{background:rgba(79,195,247,0.2);color:#4fc3f7;border:1px solid rgba(79,195,247,0.3)}
+#mode.recording{background:rgba(255,82,82,0.2);color:#ff5252;border:1px solid rgba(255,82,82,0.3);animation:pulse 1s infinite}
+#mode.thinking{background:rgba(255,215,64,0.2);color:#ffd740;border:1px solid rgba(255,215,64,0.3)}
+#mode.speaking{background:rgba(102,187,106,0.2);color:#66bb6a;border:1px solid rgba(102,187,106,0.3)}
+#btn{width:60px;height:60px;border-radius:50%;border:2px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.05);color:#aaa;font-size:24px;cursor:pointer;-webkit-tap-highlight-color:transparent;backdrop-filter:blur(4px);transition:all 0.2s}
+#btn.active{border-color:rgba(79,195,247,0.5);color:#4fc3f7;background:rgba(79,195,247,0.1)}
+#btn.recording{border-color:rgba(255,82,82,0.5);color:#ff5252;background:rgba(255,82,82,0.1);animation:pulse 1s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.6}}
+</style>
+</head>
+<body>
+
+<div id="face">
+  <div id="pixel-canvas"><canvas id="pxc" width="128" height="128"></canvas></div>
+  <div id="vol-ring"><div id="vol-fill"></div></div>
+</div>
+
+<div id="bottom">
+  <div id="asr-text"></div>
+  <div id="sub">点击开始对话</div>
+  <div id="controls">
+    <span id="mode" class="idle">待机</span>
+    <button id="btn">🎙️</button>
+  </div>
+</div>
+
+<script>
+// ===== Config =====
+const TOKEN = 'c3d47d383439a6fe73cdfd3a5698ac2d248c554905613afe';
+const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/realtime?token=' + TOKEN;
+
+// ===== State Machine =====
+// idle → connecting → listening (火山 VAD 监听中) → recording (检测到说话) → thinking → speaking → listening
+let state = 'idle';
+let ws = null;
+let audioCtx = null;
+let micStream = null;
+let scriptNode = null;
+let audioQueue = [];
+let isPlaying = false;
+
+const $ = id => document.getElementById(id);
+const setMode = (s, label) => {
+  state = s;
+  const el = $('mode');
+  el.className = s;
+  el.textContent = label || s;
+};
+const setSub = t => $('sub').textContent = t;
+const setASR = t => $('asr-text').textContent = t;
+
+// ===== Pixel Face =====
+const PX = 10;
+const expressions = {
+  idle:    {eyes:[[3,3],[8,3]],eyeH:2,mouth:[[4,8],[5,8],[6,8],[7,8]],color:'#4fc3f7'},
+  listen:  {eyes:[[3,3],[8,3]],eyeH:2,mouth:[[5,8],[6,8]],color:'#66bb6a'},
+  think:   {eyes:[[3,3],[8,3]],eyeH:1,mouth:[[4,9],[5,9],[6,9],[7,9]],color:'#ffd740'},
+  talk:    {eyes:[[3,3],[8,3]],eyeH:2,mouth:[[4,7],[5,8],[6,8],[7,7]],mouthH:2,color:'#66bb6a'},
+  happy:   {eyes:[[3,3],[8,3]],eyeH:1,mouth:[[3,8],[4,9],[5,9],[6,9],[7,9],[8,8]],color:'#ff80ab'},
+  sleep:   {eyes:[[3,4],[8,4]],eyeH:1,mouth:[[5,8],[6,8]],color:'#555'},
+  recording:{eyes:[[3,3],[8,3]],eyeH:3,mouth:[[5,8],[6,8]],color:'#ff5252'},
+};
+
+let animFrame = 0;
+let animTimer = null;
+let currentFaceName = 'sleep';
+
+function drawFace(name, frame) {
+  if (name !== undefined) currentFaceName = name;
+  const f = frame || 0;
+  const c = $('pxc').getContext('2d');
+  const e = expressions[currentFaceName] || expressions.idle;
+  c.fillStyle = '#1a1a2e';
+  c.fillRect(0, 0, 128, 128);
+  
+  let eyeOffX = 0, eyeOffY = 0;
+  let eyeH = e.eyeH || 2;
+  let mouthPixels = [...e.mouth];
+  let mouthH = e.mouthH || 1;
+  
+  // ===== Animations per state =====
+  if (currentFaceName === 'think') {
+    // Eyes look left/right
+    const cycle = f % 40;
+    if (cycle < 10) eyeOffX = -1;
+    else if (cycle < 20) eyeOffX = 0;
+    else if (cycle < 30) eyeOffX = 1;
+    else eyeOffX = 0;
+    // Occasionally squint
+    if (cycle === 5 || cycle === 25) eyeH = 1;
+  }
+  
+  if (currentFaceName === 'talk') {
+    // Mouth open/close animation
+    const cycle = f % 6;
+    if (cycle < 3) {
+      // Open mouth (big)
+      mouthPixels = [[4,7],[5,7],[6,7],[7,7],[4,8],[7,8],[4,9],[5,9],[6,9],[7,9]];
+      mouthH = 1;
+    } else {
+      // Closed mouth
+      mouthPixels = [[4,8],[5,8],[6,8],[7,8]];
+      mouthH = 1;
+    }
+  }
+  
+  if (currentFaceName === 'listen') {
+    // Blink occasionally
+    const cycle = f % 30;
+    if (cycle === 0 || cycle === 1) eyeH = 1;
+    // Slight mouth movement (breathing)
+    if (f % 20 < 10) {
+      mouthPixels = [[5,8],[6,8]];
+    } else {
+      mouthPixels = [[4,8],[5,8],[6,8],[7,8]];
+    }
+  }
+  
+  if (currentFaceName === 'recording') {
+    // Eyes wide, mouth open for recording
+    eyeH = 3;
+    const cycle = f % 8;
+    if (cycle < 4) {
+      mouthPixels = [[5,8],[6,8]];
+    } else {
+      mouthPixels = [[4,8],[5,8],[6,8],[7,8]];
+    }
+  }
+  
+  if (currentFaceName === 'happy') {
+    // Bouncy eyes
+    eyeOffY = (f % 4 < 2) ? 0 : -1;
+  }
+  
+  if (currentFaceName === 'sleep') {
+    // Zzz animation
+    c.fillStyle = '#555';
+    const zx = 10, zy = 2 - (f % 8 < 4 ? 0 : 1);
+    c.font = (PX * 1.5) + 'px monospace';
+    c.fillText('z', zx * PX, zy * PX + PX);
+    if (f % 8 < 4) c.fillText('z', (zx+1) * PX, (zy-1) * PX + PX);
+  }
+  
+  // Draw eyes
+  c.fillStyle = e.color;
+  for (const [ex, ey] of e.eyes) {
+    c.fillRect((ex + eyeOffX) * PX, (ey + eyeOffY) * PX, PX, eyeH * PX);
+  }
+  
+  // Draw mouth
+  for (const [mx, my] of mouthPixels) {
+    c.fillRect(mx * PX, my * PX, PX, mouthH * PX);
+  }
+}
+
+function startFaceAnim() {
+  if (animTimer) return;
+  animFrame = 0;
+  animTimer = setInterval(() => {
+    animFrame++;
+    drawFace(undefined, animFrame);
+  }, 120); // ~8fps
+}
+
+function stopFaceAnim() {
+  if (animTimer) { clearInterval(animTimer); animTimer = null; }
+}
+
+drawFace('sleep');
+startFaceAnim();
+
+// ===== Audio Playback =====
+function playAudioChunk(oggData) {
+  audioQueue.push(oggData);
+  if (!isPlaying) drainQueue();
+}
+
+// Persistent audio element for iOS compatibility (needs user gesture to unlock)
+let playerAudio = null;
+
+function initPlayer() {
+  if (playerAudio) return;
+  playerAudio = new Audio();
+  // Unlock audio on iOS by playing silence on user tap
+  playerAudio.src = 'data:audio/mp3;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU4Ljc2LjEwMAAAAAAAAAAAAAAA//tQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWGluZwAAAA8AAAACAAABhgC7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7//////////////////////////////////////////////////////////////////8AAAAATGF2YzU4LjEzAAAAAAAAAAAAAAAAJAAAAAAAAAABhgw7rEYAAAAAAAAAAAAAAAAA//tQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWGluZwAAAA8AAAACAAABhgC7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7//////////////////////////////////////////////////////////////////8AAAAATGF2YzU4LjEzAAAAAAAAAAAAAAAAJAAAAAAAAAABhgw7rEYAAAAAAAAAAAAAAAAA';
+  playerAudio.play().then(() => playerAudio.pause()).catch(() => {});
+}
+
+async function drainQueue() {
+  if (audioQueue.length === 0) {
+    isPlaying = false;
+    if (state === 'speaking') {
+      setMode('listening', '聆听中');
+      drawFace('listen');
+      setASR('');
+      // Reconnect mic after playback
+      reconnectMic();
+    }
+    return;
+  }
+  isPlaying = true;
+  const chunk = audioQueue.shift();
+  
+  try {
+    const blob = new Blob([chunk], { type: 'audio/mpeg' });
+    const url = URL.createObjectURL(blob);
+    
+    // Use persistent audio element
+    if (!playerAudio) playerAudio = new Audio();
+    playerAudio.src = url;
+    
+    const cleanup = () => {
+      URL.revokeObjectURL(url);
+      clearInterval(pollEnd);
+      drainQueue();
+    };
+    
+    playerAudio.onended = cleanup;
+    playerAudio.onerror = (e) => { console.warn('Audio error:', e); cleanup(); };
+    
+    // iOS polling fallback
+    const pollEnd = setInterval(() => {
+      if (playerAudio.ended || (playerAudio.paused && playerAudio.currentTime > 0)) {
+        cleanup();
+      }
+    }, 200);
+    
+    await playerAudio.play();
+    console.log('Playing audio:', chunk.length, 'bytes');
+  } catch (e) {
+    console.warn('Audio play error:', e);
+    drainQueue();
+  }
+}
+
+function reconnectMic() {
+  if (!micStream || !audioCtx || !ws || ws.readyState !== 1) return;
+  try {
+    const source = audioCtx.createMediaStreamSource(micStream);
+    scriptNode = audioCtx.createScriptProcessor(1024, 1, 1);
+    const ratio = audioCtx.sampleRate / 16000;
+    
+    scriptNode.onaudioprocess = (e) => {
+      if (!ws || ws.readyState !== 1 || state === 'idle' || state === 'speaking') return;
+      const float32 = e.inputBuffer.getChannelData(0);
+      
+      let sum = 0;
+      for (let i = 0; i < float32.length; i++) sum += float32[i] * float32[i];
+      const vol = Math.min(100, Math.sqrt(sum / float32.length) * 500);
+      $('vol-fill').style.width = vol + '%';
+      
+      const outLen = Math.floor(float32.length / ratio);
+      const int16 = new Int16Array(outLen);
+      for (let i = 0; i < outLen; i++) {
+        const s = Math.max(-1, Math.min(1, float32[Math.floor(i * ratio)]));
+        int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
+      ws.send(int16.buffer);
+    };
+    
+    source.connect(scriptNode);
+    scriptNode.connect(audioCtx.destination);
+  } catch (e) {
+    console.warn('Mic reconnect error:', e);
+  }
+}
+
+// ===== WebSocket Connection =====
+function connect() {
+  if (ws && ws.readyState <= 1) return;
+  
+  setMode('connecting', '连接中...');
+  setSub('正在连接服务器...');
+  
+  ws = new WebSocket(WS_URL);
+  ws.binaryType = 'arraybuffer';
+  
+  ws.onopen = () => {
+    console.log('WS connected');
+  };
+  
+  ws.onmessage = (evt) => {
+    // Check if binary (audio) or text (JSON)
+    if (evt.data instanceof ArrayBuffer) {
+      console.log('Received audio:', evt.data.byteLength, 'bytes');
+      if (state !== 'speaking') {
+        setMode('speaking', '说话中');
+        drawFace('talk');
+      }
+      // Stop mic while playing to avoid echo
+      if (scriptNode) scriptNode.disconnect();
+      playAudioChunk(new Uint8Array(evt.data));
+      return;
+    }
+    
+    // Text message - could be JSON string or binary-as-string
+    let text = evt.data;
+    if (typeof text !== 'string') {
+      // ArrayBuffer was caught above, this shouldn't happen
+      return;
+    }
+    
+    try {
+      const msg = JSON.parse(text);
+      handleMessage(msg);
+    } catch(e) {
+      console.warn('Non-JSON message:', text.slice(0, 50));
+    }
+  };
+  
+  ws.onclose = (e) => {
+    console.log('WS closed, code:', e.code);
+    stopMic();
+    if (state !== 'idle') {
+      reconnectCount = (reconnectCount || 0) + 1;
+      if (reconnectCount <= 3) {
+        setMode('idle', '重连中...');
+        setSub('自动重连 (' + reconnectCount + '/3)...');
+        drawFace('sleep');
+        setTimeout(() => {
+          if (state === 'idle') connect();
+        }, 1500 * reconnectCount);
+      } else {
+        setMode('idle', '已断开');
+        setSub('点击重新连接');
+        drawFace('sleep');
+        reconnectCount = 0;
+      }
+    }
+  };
+  
+  ws.onerror = (e) => {
+    console.error('WS error', e);
+  };
+}
+
+function handleMessage(msg) {
+  switch(msg.type) {
+    case 'ready':
+      console.log('Session ready:', msg.dialogId);
+      reconnectCount = 0;
+      startMic();
+      setMode('listening', '💤 等待唤醒');
+      setSub('Say wake word to activate');
+      drawFace('sleep');
+      break;
+    
+    case 'asr':
+      // Streaming ASR - show intermediate text
+      setASR('🎤 ' + msg.text);
+      if (state === 'listening') {
+        setMode('recording', '录音中');
+        drawFace('recording');
+      }
+      // Safety: if stuck in recording for 10s, reset
+      if (window._recTimer) clearTimeout(window._recTimer);
+      window._recTimer = setTimeout(() => {
+        if (state === 'recording') {
+          console.log('Recording timeout, resetting');
+          setASR('');
+          setMode('listening', '💤 等待唤醒');
+          setSub('Say wake word to activate');
+          drawFace('sleep');
+        }
+      }, 10000);
+      break;
+    
+    case 'ignored':
+      // No wake word, go back to sleep
+      setASR('');
+      setMode('listening', '💤 等待唤醒');
+      setSub('Say wake word to activate');
+      drawFace('sleep');
+      break;
+    
+    case 'sleep':
+      // Auto-sleep after timeout
+      setASR('');
+      setMode('listening', '聆听中');
+      setSub('Say wake word to activate');
+      drawFace('sleep');
+      break;
+    
+    case 'asr_final':
+      setASR('📝 ' + msg.text);
+      setMode('thinking', '思考中...');
+      drawFace('think');
+      break;
+    
+    case 'thinking':
+      setMode('thinking', '思考中...');
+      drawFace('think');
+      break;
+    
+    case 'ai_reply':
+      setSub(msg.text);
+      break;
+    
+    case 'tts_text':
+      setSub(msg.text);
+      break;
+    
+    case 'usage':
+      console.log('Usage:', msg.data);
+      break;
+    
+    case 'error':
+      console.error('Server error:', msg.message);
+      setSub('⚠️ ' + msg.message);
+      setTimeout(() => {
+        if (state !== 'idle') {
+          setSub('说话试试...');
+          setMode('listening', '聆听中');
+          drawFace('listen');
+          setASR('');
+        }
+      }, 2000);
+      break;
+    
+    case 'tts_end':
+      // TTS finished, back to listening (still awake)
+      setTimeout(() => {
+        if (state === 'speaking' && !isPlaying) {
+          setMode('listening', '聆听中');
+          setSub('继续说话，或等待休眠');
+          drawFace('listen');
+          setASR('');
+        }
+      }, 500);
+      break;
+  }
+}
+
+// ===== Microphone → PCM Stream =====
+async function startMic() {
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
+    });
+    
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)({sampleRate: 16000});
+    
+    // If audioCtx sample rate doesn't match 16kHz, we need to resample
+    const source = audioCtx.createMediaStreamSource(micStream);
+    
+    // Use ScriptProcessorNode (widely supported including iOS Safari)
+    const bufSize = 1024; // ~64ms at 16kHz
+    scriptNode = audioCtx.createScriptProcessor(bufSize, 1, 1);
+    
+    scriptNode.onaudioprocess = (e) => {
+      if (!ws || ws.readyState !== 1) return;
+      if (state === 'idle') return;
+      
+      const float32 = e.inputBuffer.getChannelData(0);
+      
+      // Volume visualization
+      let sum = 0;
+      for (let i = 0; i < float32.length; i++) sum += float32[i] * float32[i];
+      const rms = Math.sqrt(sum / float32.length);
+      const vol = Math.min(100, rms * 500);
+      $('vol-fill').style.width = vol + '%';
+      
+      // Convert Float32 → Int16 PCM
+      const int16 = new Int16Array(float32.length);
+      for (let i = 0; i < float32.length; i++) {
+        const s = Math.max(-1, Math.min(1, float32[i]));
+        int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
+      
+      // Send PCM binary
+      ws.send(int16.buffer);
+    };
+    
+    source.connect(scriptNode);
+    scriptNode.connect(audioCtx.destination); // Required for onaudioprocess to fire
+    
+    console.log('Mic started, sampleRate:', audioCtx.sampleRate);
+    
+    // If audioCtx is not 16kHz, we need to handle resampling
+    if (audioCtx.sampleRate !== 16000) {
+      console.warn('AudioContext sampleRate is', audioCtx.sampleRate, '- resampling needed');
+      // The ScriptProcessor will give us data at audioCtx.sampleRate
+      // We need to downsample to 16kHz
+      const ratio = audioCtx.sampleRate / 16000;
+      const origProcess = scriptNode.onaudioprocess;
+      scriptNode.onaudioprocess = (e) => {
+        if (!ws || ws.readyState !== 1 || state === 'idle') return;
+        const float32 = e.inputBuffer.getChannelData(0);
+        
+        // Volume viz
+        let sum = 0;
+        for (let i = 0; i < float32.length; i++) sum += float32[i] * float32[i];
+        const vol = Math.min(100, Math.sqrt(sum / float32.length) * 500);
+        $('vol-fill').style.width = vol + '%';
+        
+        // Downsample
+        const outLen = Math.floor(float32.length / ratio);
+        const int16 = new Int16Array(outLen);
+        for (let i = 0; i < outLen; i++) {
+          const idx = Math.floor(i * ratio);
+          const s = Math.max(-1, Math.min(1, float32[idx]));
+          int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        }
+        ws.send(int16.buffer);
+      };
+    }
+    
+  } catch (err) {
+    console.error('Mic error:', err);
+    setSub('⚠️ 无法访问麦克风');
+  }
+}
+
+function stopMic() {
+  if (scriptNode) { scriptNode.disconnect(); scriptNode = null; }
+  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+}
+
+// ===== Button =====
+$('btn').onclick = () => {
+  if (state === 'idle') {
+    // Resume AudioContext & init audio player (iOS requires user gesture)
+    if (audioCtx?.state === 'suspended') audioCtx.resume();
+    initPlayer();
+    connect();
+  } else {
+    // Disconnect
+    stopMic();
+    if (ws) ws.close();
+    ws = null;
+    audioQueue = [];
+    isPlaying = false;
+    setMode('idle', '待机');
+    setSub('点击开始对话');
+    drawFace('sleep');
+    setASR('');
+  }
+};
+
+// ===== Keep screen awake =====
+if ('wakeLock' in navigator) {
+  navigator.wakeLock.request('screen').catch(()=>{});
+}
+</script>
+</body>
+</html>
